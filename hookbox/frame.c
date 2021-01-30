@@ -12,10 +12,12 @@ typedef struct _struct_FrameHeader {
 } FrameHeader_t;
 
 static void s_InitDispWindow(void);
+static BOOL s_CheckPipeWrite(BOOL bOK);
 
 extern HINSTANCE g_hInstance;
 static HANDLE s_hPipe = NULL;
 static FrameHeader_t s_header;
+static char s_szPipeName[128];
 
 __declspec(dllexport) void __stdcall AcceptFrame(unsigned nWidth, unsigned nHeight, unsigned nBPP, unsigned nPitch, unsigned flags,
 	float fFPS, unsigned char* pData, unsigned char* pPalette)
@@ -23,7 +25,8 @@ __declspec(dllexport) void __stdcall AcceptFrame(unsigned nWidth, unsigned nHeig
 	DWORD nWritten = 0, nError = 0;
 
 	if (s_hPipe == NULL) {
-		s_hPipe = CreateNamedPipeA("\\\\.\\pipe\\DOSDisplay", PIPE_ACCESS_OUTBOUND, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, 0, 0, HB_WRITE_TIMEOUT, NULL);
+		sprintf_s(s_szPipeName, sizeof(s_szPipeName), "\\\\.\\pipe\\DOSDisplay%u", GetCurrentProcessId());
+		s_hPipe = CreateNamedPipeA(s_szPipeName, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, 0, 0, HB_WRITE_TIMEOUT, NULL);
 		HB_ASSERT((s_hPipe != NULL) && s_hPipe != INVALID_HANDLE_VALUE);
 	}
 
@@ -39,15 +42,32 @@ __declspec(dllexport) void __stdcall AcceptFrame(unsigned nWidth, unsigned nHeig
 			memset(&s_header.m_arrPalette[nBPP * 8], 0, (8 - nBPP) * 8 * 4);
 	}
 
-	if (!WriteFile(s_hPipe, &s_header, sizeof(s_header), &nWritten, NULL)) {
+	if (s_CheckPipeWrite(WriteFile(s_hPipe, &s_header, sizeof(s_header), &nWritten, NULL)))
+		s_CheckPipeWrite(WriteFile(s_hPipe, pData, nHeight * nPitch, &nWritten, NULL));
+}
+
+static BOOL s_CheckPipeWrite(BOOL bOK) {
+	DWORD nError;
+
+	if (!bOK) {
 		nError = GetLastError();
-		if ((nError != ERROR_TIMEOUT) && (nError != ERROR_PIPE_LISTENING))
+		switch (nError) {
+		case ERROR_NO_DATA:
+		case ERROR_BROKEN_PIPE:
+			// other end closed
+			CloseHandle(s_hPipe);
+			s_hPipe = NULL;
+			return FALSE;
+
+		case ERROR_TIMEOUT:
+		case ERROR_PIPE_LISTENING:
+			// skip frame
+			return FALSE;
+
+		default:
 			AssertFailed("Writing header to pipe", nError);
+		}
 	}
 
-	if (!WriteFile(s_hPipe, pData, nHeight * nPitch, &nWritten, NULL)) {
-		nError = GetLastError();
-		if ((nError != ERROR_TIMEOUT) && (nError != ERROR_PIPE_LISTENING))
-			AssertFailed("Writing data to pipe", nError);
-	}
+	return TRUE;
 }

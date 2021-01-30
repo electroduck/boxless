@@ -32,7 +32,8 @@ static DWORD CALLBACK s_InputThreadProc(LPVOID pParam) {
 
 	HB_ASSERT(SetThreadDesktop(s_hDOSDesktop));
 
-	hSlot = CreateMailslotA("\\\\.\\mailslot\\DOSEvent", HB_INPUT_BY_WINDOW_MESSAGE ? sizeof(MSG) : sizeof(SDL_Event), INFINITE, NULL);
+	sprintf_s(szBuffer, sizeof(szBuffer), "\\\\.\\mailslot\\DOSEvent%u", GetCurrentProcessId());
+	hSlot = CreateMailslotA(szBuffer, HB_INPUT_BY_WINDOW_MESSAGE ? sizeof(MSG) : sizeof(SDL_Event), INFINITE, NULL);
 	HB_ASSERT((hSlot != NULL) && (hSlot != INVALID_HANDLE_VALUE));
 
 #if HB_INPUT_BY_WINDOW_MESSAGE

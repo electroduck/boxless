@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <stdio.h>
 #include <SDL.h>
 
@@ -27,6 +28,8 @@ static int s_AssertFailed(LPCSTR pcszCode, DWORD nLastError);
 static LRESULT CALLBACK s_DisplayWindowProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam);
 static DWORD CALLBACK s_ReaderThreadProc(LPVOID pParam);
 static void s_ProcessKeyboardInput(UINT nMessage, WPARAM wParam, LPARAM lParam);
+static DWORD s_ShowPIDMenu(void);
+static void s_ReplacementPrintf(LPCSTR pcszFormat, ...);
 
 static const char s_cszDisplayWindowClass[] = "FrameDisplayWindow";
 static HWND s_hWndDisplay = NULL;
@@ -34,6 +37,9 @@ static HBITMAP s_hFrameBitmap = NULL;
 static int s_nFrameWidth = 0, s_nFrameHeight = 0;
 static CRITICAL_SECTION s_csFrameBitmap;
 static HANDLE s_hSlotEvents = NULL;
+static DWORD s_nDOSBoxPID = 0;
+static char s_szDOSEventSlotName[MAX_PATH];
+static char s_szDOSFramePipeName[MAX_PATH];
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR pszCmdLine, int nShowCmd) {
 	WNDCLASSEXA wcxa;
@@ -41,15 +47,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR pszCmdLin
 	DWORD nReaderThreadID;
 	MSG msg;
 
+	s_nDOSBoxPID = s_ShowPIDMenu();
+	if (s_nDOSBoxPID == 0) return 0;
+	sprintf_s(s_szDOSEventSlotName, sizeof(s_szDOSEventSlotName), "\\\\.\\mailslot\\DOSEvent%u", s_nDOSBoxPID);
+	sprintf_s(s_szDOSFramePipeName, sizeof(s_szDOSFramePipeName), "\\\\.\\pipe\\DOSDisplay%u", s_nDOSBoxPID);
+
 	InitializeCriticalSection(&s_csFrameBitmap);
 
-	s_hSlotEvents = CreateFileA("\\\\.\\mailslot\\DOSEvent", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	s_hSlotEvents = CreateFileA(s_szDOSEventSlotName, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	FD_ASSERT((s_hSlotEvents != NULL) && (s_hSlotEvents != INVALID_HANDLE_VALUE));
 
 	ZeroMemory(&wcxa, sizeof(wcxa));
 	wcxa.cbSize = sizeof(wcxa);
 	wcxa.lpfnWndProc = s_DisplayWindowProc;
 	wcxa.lpszClassName = s_cszDisplayWindowClass;
+	wcxa.hCursor = LoadCursor(NULL, IDC_ARROW);
 	FD_ASSERT(RegisterClassExA(&wcxa));
 
 	s_hWndDisplay = CreateWindowExA(0, s_cszDisplayWindowClass, "Frame Display", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -87,6 +99,7 @@ static LRESULT CALLBACK s_DisplayWindowProc(HWND hWnd, UINT nMessage, WPARAM wPa
 	HDC hTempDC;
 	HGDIOBJ hOldBitmap;
 	RECT rcClient;
+	int nPrevStretchMode;
 
 	switch (nMessage) {
 	case WM_CLOSE:
@@ -100,7 +113,9 @@ static LRESULT CALLBACK s_DisplayWindowProc(HWND hWnd, UINT nMessage, WPARAM wPa
 		if (s_hFrameBitmap) {
 			FD_ASSERT(hTempDC = CreateCompatibleDC(ps.hdc));
 			FD_ASSERT(hOldBitmap = SelectObject(hTempDC, s_hFrameBitmap));
+			nPrevStretchMode = SetStretchBltMode(ps.hdc, HALFTONE);
 			FD_ASSERT(StretchBlt(ps.hdc, 0, 0, rcClient.right, rcClient.bottom, hTempDC, 0, 0, s_nFrameWidth, s_nFrameHeight, SRCCOPY));
+			SetStretchBltMode(ps.hdc, nPrevStretchMode);
 			SelectObject(hTempDC, hOldBitmap);
 			DeleteDC(hTempDC);
 		} else {
@@ -139,7 +154,7 @@ static DWORD CALLBACK s_ReaderThreadProc(LPVOID pParam) {
 	unsigned nEntry;
 
 	FD_ASSERT(hHeap = GetProcessHeap());
-	FD_ASSERT(hPipe = CreateFileA("\\\\.\\pipe\\DOSDisplay", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL));
+	FD_ASSERT(hPipe = CreateFileA(s_szDOSFramePipeName, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL));
 	FD_ASSERT(hPipe != INVALID_HANDLE_VALUE);
 
 	FD_ASSERT(hScreenDC = GetDC(NULL));
@@ -217,4 +232,60 @@ static void s_ProcessKeyboardInput(UINT nMessage, WPARAM wParam, LPARAM lParam) 
 	msg.lParam = lParam;
 
 	FD_ASSERT(WriteFile(s_hSlotEvents, &msg, sizeof(msg), &nWritten, NULL));
+}
+
+static DWORD s_ShowPIDMenu(void) {
+	HWND hConsoleWindow;
+	PROCESSENTRY32 entry;
+	HANDLE hSnapshot;
+	char* pszPathChar;
+	long nPID;
+	char szPID[80];
+	DWORD nRead;
+
+	FD_ASSERT(AllocConsole());
+	FD_ASSERT(hConsoleWindow = GetConsoleWindow());
+	ShowWindow(hConsoleWindow, SW_SHOW);
+
+	s_ReplacementPrintf("DOSBox processes:\r\n");
+
+	hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	FD_ASSERT(hSnapshot != INVALID_HANDLE_VALUE);
+
+	entry.dwSize = sizeof(entry);
+	FD_ASSERT(Process32First(hSnapshot, &entry));
+
+	do {
+		for (pszPathChar = entry.szExeFile; *pszPathChar; pszPathChar++)
+			*pszPathChar = toupper(*pszPathChar);
+
+		if (strstr(entry.szExeFile, "DOSBOX"))
+			s_ReplacementPrintf("%10u\t%s\r\n", entry.th32ProcessID, entry.szExeFile);
+	} while (Process32Next(hSnapshot, &entry));
+
+	CloseHandle(hSnapshot);
+
+	nPID = 0; 
+	while (!nPID) {
+		s_ReplacementPrintf("Enter target PID, or negative to cancel: ");
+		FD_ASSERT(ReadFile(GetStdHandle(STD_INPUT_HANDLE), szPID, sizeof(szPID), &nRead, NULL));
+		nPID = strtol(szPID, NULL, 0);
+	}
+
+	ShowWindow(hConsoleWindow, SW_HIDE);
+	FreeConsole();
+
+	return (nPID < 0) ? 0 : (DWORD)nPID;
+}
+
+static void s_ReplacementPrintf(LPCSTR pcszFormat, ...) {
+	char szBuffer[256];
+	va_list va;
+	DWORD nWritten;
+
+	va_start(va, pcszFormat);
+	vsprintf_s(szBuffer, sizeof(szBuffer), pcszFormat, va);
+	va_end(va);
+
+	FD_ASSERT(WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), szBuffer, strlen(szBuffer), &nWritten, NULL));
 }
